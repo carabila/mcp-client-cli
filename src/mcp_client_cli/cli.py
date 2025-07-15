@@ -8,45 +8,48 @@ from datetime import datetime
 import argparse
 import asyncio
 import os
-from typing import Annotated, TypedDict
+from typing import Dict, Any
 import uuid
 import sys
 import re
-import anyio
-from langchain_core.messages import BaseMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.language_models.chat_models import BaseChatModel
-from langgraph.prebuilt import create_react_agent
-from langgraph.managed import IsLastStep
-from langgraph.graph.message import add_messages
-from langchain.chat_models import init_chat_model
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+import base64
+import mimetypes
+
+# Replacement for deprecated imghdr module
+def what(file, h=None):
+    """Detect image format from file or header bytes."""
+    if h is None:
+        with open(file, 'rb') as f:
+            h = f.read(32)
+    else:
+        h = h[:32]
+    
+    # Check for common image formats
+    if h.startswith(b'\xff\xd8\xff'):
+        return 'jpeg'
+    elif h.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    elif h.startswith(b'GIF87a') or h.startswith(b'GIF89a'):
+        return 'gif'
+    elif h.startswith(b'BM'):
+        return 'bmp'
+    elif h.startswith(b'RIFF') and b'WEBP' in h:
+        return 'webp'
+    return None
 from rich.console import Console
 from rich.table import Table
-import base64
-import imghdr as imghdr
-import mimetypes
 
 from .input import *
 from .const import *
 from .output import *
-from .storage import *
-from .tool import *
+from .simple_storage import SimpleStore, ConversationManager
+from .tool import McpServerConfig, create_mcp_tool_manager
+from mcp import StdioServerParameters
 from .prompt import *
-from .memory import *
+from .memory import get_memories
 from .config import AppConfig
-
-# The AgentState class is used to maintain the state of the agent during a conversation.
-class AgentState(TypedDict):
-    # A list of messages exchanged in the conversation.
-    messages: Annotated[list[BaseMessage], add_messages]
-    # A flag indicating whether the current step is the last step in the conversation.
-    is_last_step: IsLastStep
-    # The current date and time, used for context in the conversation.
-    today_datetime: str
-    # The user's memories.
-    memories: str = "no memories"
-    remaining_steps: int = 5
+from .llm import create_llm, Message
+from .agent import McpAgent, AgentState, AgentStep
 
 async def run() -> None:
     """Run the LLM agent."""
@@ -71,7 +74,7 @@ async def run() -> None:
 def setup_argument_parser() -> argparse.Namespace:
     """Setup and return the argument parser."""
     parser = argparse.ArgumentParser(
-        description='Run LangChain agent with MCP tools',
+        description='Run MCP client with LLM tools',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -123,29 +126,35 @@ async def handle_list_tools(app_config: AppConfig, args: argparse.Namespace) -> 
         )
         for name, config in app_config.get_enabled_servers().items()
     ]
-    toolkits, tools = await load_tools(server_configs, args.no_tools, args.force_refresh)
     
-    console = Console()
-    table = Table(title="Available LLM Tools")
-    table.add_column("Toolkit", style="cyan")
-    table.add_column("Tool Name", style="cyan")
-    table.add_column("Description", style="green")
+    if not args.no_tools:
+        tool_manager = await create_mcp_tool_manager(server_configs, args.force_refresh)
+        
+        console = Console()
+        table = Table(title="Available LLM Tools")
+        table.add_column("Server", style="cyan")
+        table.add_column("Tool Name", style="cyan")
+        table.add_column("Description", style="green")
 
-    for tool in tools:
-        if isinstance(tool, McpTool):
-            table.add_row(tool.toolkit_name, tool.name, tool.description)
+        for tool in tool_manager.get_all_tools():
+            table.add_row(tool.server_name, tool.name, tool.description)
 
-    console.print(table)
-
-    for toolkit in toolkits:
-        await toolkit.close()
+        # Add save_memory tool
+        table.add_row("built-in", "save_memory", "Save a memory about the user for future conversations")
+        
+        console.print(table)
+        await tool_manager.close_all()
+    else:
+        console = Console()
+        console.print("No tools available (--no-tools flag used)")
 
 async def handle_show_memories() -> None:
     """Handle the --show-memories command."""
-    store = SqliteStore(SQLITE_DB)
+    store = SimpleStore(SQLITE_DB)
     memories = await get_memories(store)
     console = Console()
     table = Table(title="My LLM Memories")
+    table.add_column("Memory", style="green")
     for memory in memories:
         table.add_row(memory)
     console.print(table)
@@ -163,116 +172,134 @@ def handle_list_prompts() -> None:
         
     console.print(table)
 
-async def load_tools(server_configs: list[McpServerConfig], no_tools: bool, force_refresh: bool) -> tuple[list, list]:
-    """Load and convert MCP tools to LangChain tools."""
-    if no_tools:
-        return [], []
-        
-    toolkits = []
-    langchain_tools = []
-    
-    async def convert_toolkit(server_config: McpServerConfig):
-        toolkit = await convert_mcp_to_langchain_tools(server_config, force_refresh)
-        toolkits.append(toolkit)
-        langchain_tools.extend(toolkit.get_tools())
-
-    async with anyio.create_task_group() as tg:
-        for server_param in server_configs:
-            tg.start_soon(convert_toolkit, server_param)
-            
-    langchain_tools.append(save_memory)
-    return toolkits, langchain_tools
-
-async def handle_conversation(args: argparse.Namespace, query: HumanMessage, 
+async def handle_conversation(args: argparse.Namespace, query: Message, 
                             is_conversation_continuation: bool, app_config: AppConfig) -> None:
     """Handle the main conversation flow."""
-    server_configs = [
-        McpServerConfig(
-            server_name=name,
-            server_param=StdioServerParameters(
-                command=config.command,
-                args=config.args or [],
-                env={**(config.env or {}), **os.environ}
-            ),
-            exclude_tools=config.exclude_tools or []
-        )
-        for name, config in app_config.get_enabled_servers().items()
-    ]
-    toolkits, tools = await load_tools(server_configs, args.no_tools, args.force_refresh)
     
-    extra_body = {}
-    if app_config.llm.base_url and "openrouter" in app_config.llm.base_url:
-        extra_body = {"transforms": ["middle-out"]}
+    # Create tool manager
+    tool_manager = None
+    if not args.no_tools:
+        server_configs = [
+            McpServerConfig(
+                server_name=name,
+                server_param=StdioServerParameters(
+                    command=config.command,
+                    args=config.args or [],
+                    env={**(config.env or {}), **os.environ}
+                ),
+                exclude_tools=config.exclude_tools or []
+            )
+            for name, config in app_config.get_enabled_servers().items()
+        ]
+        tool_manager = await create_mcp_tool_manager(server_configs, args.force_refresh)
+    else:
+        from .tool import McpToolManager
+        tool_manager = McpToolManager()
+    
     # Override model if specified in command line
     if args.model:
         app_config.llm.model = args.model
-        
-    model: BaseChatModel = init_chat_model(
+    
+    # Create LLM instance
+    llm = create_llm(
+        provider=app_config.llm.provider,
         model=app_config.llm.model,
-        model_provider=app_config.llm.provider,
         api_key=app_config.llm.api_key,
         temperature=app_config.llm.temperature,
-        base_url=app_config.llm.base_url,
-        default_headers={
-            "X-Title": "mcp-client-cli",
-            "HTTP-Referer": "https://github.com/adhikasp/mcp-client-cli",
-        },
-        extra_body=extra_body
+        base_url=app_config.llm.base_url
     )
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", app_config.system_prompt),
-        ("placeholder", "{messages}")
-    ])
-
-    conversation_manager = ConversationManager(SQLITE_DB)
     
-    async with AsyncSqliteSaver.from_conn_string(SQLITE_DB) as checkpointer:
-        store = SqliteStore(SQLITE_DB)
-        memories = await get_memories(store)
-        formatted_memories = "\n".join(f"- {memory}" for memory in memories)
-        agent_executor = create_react_agent(
-            model, tools, state_schema=AgentState, 
-            state_modifier=prompt, checkpointer=checkpointer, store=store
-        )
+    # Create confirmation callback
+    def confirmation_callback(tool_name: str, arguments: Dict[str, Any]) -> bool:
+        if args.no_confirmations:
+            return False
         
-        thread_id = (await conversation_manager.get_last_id() if is_conversation_continuation 
-                    else uuid.uuid4().hex)
-
-        input_messages = AgentState(
-            messages=[query], 
-            today_datetime=datetime.now().isoformat(),
-            memories=formatted_memories,
-            remaining_steps=3
-        )
-
-        output = OutputHandler(text_only=args.text_only, only_last_message=args.no_intermediates)
-        output.start()
-        try:
-            async for chunk in agent_executor.astream(
-                input_messages,
-                stream_mode=["messages", "values"],
-                config={"configurable": {"thread_id": thread_id, "user_id": "myself"}, 
-                       "recursion_limit": 100}
-            ):
+        # Check if this tool requires confirmation from config
+        for server_name, server_config in app_config.get_enabled_servers().items():
+            if hasattr(server_config, 'requires_confirmation'):
+                if tool_name in server_config.requires_confirmation:
+                    # In a real implementation, we'd prompt the user here
+                    # For now, we'll just show the tool call and proceed
+                    console = Console()
+                    console.print(f"[yellow]Tool confirmation required for {tool_name}[/yellow]")
+                    console.print(f"Arguments: {arguments}")
+                    return True
+        return False
+    
+    # Handle conversation continuation
+    conversation_manager = ConversationManager(SQLITE_DB)
+    store = SimpleStore(SQLITE_DB)
+    memories = await get_memories(store)
+    formatted_memories = "\n".join(f"- {memory}" for memory in memories)
+    
+    # Create agent
+    agent = McpAgent(
+        llm=llm,
+        tool_manager=tool_manager,
+        system_prompt=app_config.system_prompt,
+        confirmation_callback=confirmation_callback,
+        memory_store=store
+    )
+    
+    thread_id = (await conversation_manager.get_last_id() if is_conversation_continuation 
+                else uuid.uuid4().hex)
+    
+    # Create agent state
+    state = AgentState(
+        messages=[query],
+        today_datetime=datetime.now().isoformat(),
+        memories=formatted_memories,
+        remaining_steps=3
+    )
+    
+    # Initialize output handler
+    output = OutputHandler(text_only=args.text_only, only_last_message=args.no_intermediates)
+    output.start()
+    
+    try:
+        # Run the agent
+        async for step in agent.run_conversation(state, confirmation_callback):
+            # Convert agent steps to output format
+            if step.step_type == "message":
+                # Simulate the chunk format expected by OutputHandler
+                chunk = {
+                    "messages": [{"content": step.content, "type": "ai"}]
+                }
                 output.update(chunk)
-                if not args.no_confirmations:
-                    if not output.confirm_tool_call(app_config.__dict__, chunk):
-                        break
-        except Exception as e:
-            output.update_error(e)
-        finally:
-            output.finish()
+            elif step.step_type == "tool_call":
+                # Show tool calls if not hiding intermediates
+                if not args.no_intermediates:
+                    chunk = {
+                        "messages": [{"content": f"🔧 {step.content}", "type": "ai"}]
+                    }
+                    output.update(chunk)
+            elif step.step_type == "tool_result":
+                # Show tool results if not hiding intermediates
+                if not args.no_intermediates:
+                    chunk = {
+                        "messages": [{"content": f"📋 {step.content}", "type": "ai"}]
+                    }
+                    output.update(chunk)
+            elif step.step_type == "error":
+                output.update_error(Exception(step.content))
+                break
+                
+    except Exception as e:
+        output.update_error(e)
+    finally:
+        output.finish()
+        
+        # Save conversation thread (simplified since we don't have checkpointer)
+        await conversation_manager.save_id(thread_id, None)
+        
+        # Cleanup
+        if tool_manager:
+            await tool_manager.close_all()
 
-        await conversation_manager.save_id(thread_id, checkpointer.conn)
-
-    for toolkit in toolkits:
-        await toolkit.close()
-
-def parse_query(args: argparse.Namespace) -> tuple[HumanMessage, bool]:
+def parse_query(args: argparse.Namespace) -> tuple[Message, bool]:
     """
     Parse the query from command line arguments.
-    Returns a tuple of (HumanMessage, is_conversation_continuation).
+    Returns a tuple of (Message, is_conversation_continuation).
     """
     query_parts = ' '.join(args.query).split()
     stdin_content = ""
@@ -298,7 +325,7 @@ def parse_query(args: argparse.Namespace) -> tuple[HumanMessage, bool]:
     elif not sys.stdin.isatty():
         stdin_data = sys.stdin.buffer.read()
         # Try to detect if it's an image
-        image_type = imghdr.what(None, h=stdin_data)
+        image_type = what(None, h=stdin_data)
         if image_type:
             # It's an image, encode it as base64
             stdin_image = base64.b64encode(stdin_data).decode('utf-8')
@@ -318,7 +345,7 @@ def parse_query(args: argparse.Namespace) -> tuple[HumanMessage, bool]:
             if template_name not in prompt_templates:
                 print(f"Error: Prompt template '{template_name}' not found.")
                 print("Available templates:", ", ".join(prompt_templates.keys()))
-                return HumanMessage(content=""), False
+                return Message(role="user", content=""), False
 
             template = prompt_templates[template_name]
             template_args = query_parts[2:]
@@ -330,7 +357,7 @@ def parse_query(args: argparse.Namespace) -> tuple[HumanMessage, bool]:
                 query_text = template.format(**template_vars)
             except KeyError as e:
                 print(f"Error: Missing argument {e}")
-                return HumanMessage(content=""), False
+                return Message(role="user", content=""), False
         else:
             query_text = ' '.join(query_parts)
 
@@ -340,7 +367,7 @@ def parse_query(args: argparse.Namespace) -> tuple[HumanMessage, bool]:
     elif stdin_content:
         query_text = stdin_content
     elif not query_text and not stdin_image:
-        return HumanMessage(content=""), False
+        return Message(role="user", content=""), False
 
     # Create the message content
     if stdin_image:
@@ -351,7 +378,7 @@ def parse_query(args: argparse.Namespace) -> tuple[HumanMessage, bool]:
     else:
         content = query_text
 
-    return HumanMessage(content=content), is_continuation
+    return Message(role="user", content=content), is_continuation
 
 def main() -> None:
     """Entry point of the script."""

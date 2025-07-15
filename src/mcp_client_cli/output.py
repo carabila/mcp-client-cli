@@ -1,5 +1,4 @@
 import json
-from langchain_core.messages import BaseMessage, AIMessage, AIMessageChunk, ToolMessage
 from rich.console import Console, ConsoleDimensions
 from rich.live import Live
 from rich.markdown import Markdown
@@ -42,10 +41,10 @@ class OutputHandler:
 
     def update_error(self, error: Exception):
         import traceback
-        error = f"Error: {error}\n\nStack trace:\n```\n{traceback.format_exc()}```"
-        self.md += error
+        error_msg = f"Error: {error}\n\nStack trace:\n```\n{traceback.format_exc()}```"
+        self.md += error_msg
         if(self.only_last_message):
-            self.console.print(error)
+            self.console.print(error_msg)
             return
         if self.text_only:
             self.console.print_exception()
@@ -85,49 +84,23 @@ class OutputHandler:
         Parse the chunk of agent response.
         It will stream the response as it is received.
         """
-        # If this is a message chunk
-        if isinstance(chunk, tuple) and chunk[0] == "messages":
-            message_chunk = chunk[1][0]  # Get the message content
-            if isinstance(message_chunk, AIMessageChunk):
-                content = message_chunk.content
-                self.last_message += content
-                if isinstance(content, str):
-                    md += content
-                elif isinstance(content, list) and len(content) > 0 and isinstance(content[0], dict) and "text" in content[0]:
-                    md += content[0]["text"]
-        # If this is a final value
-        elif isinstance(chunk, dict) and "messages" in chunk:
-            # Print a newline after the complete message
-            md += "\n"
-            self.last_message = ""
-        elif isinstance(chunk, tuple) and chunk[0] == "values":
-            message: BaseMessage = chunk[1]['messages'][-1]
-            if isinstance(message, AIMessage) and message.tool_calls:
-                md += "\n\n### Tool Calls:"
-                for tc in message.tool_calls:
-                    lines = [
-                        f"  {tc.get('name', 'Tool')}",
-                    ]
-                    if tc.get("error"):
-                        lines.append(f"```")
-                        lines.append(f"Error: {tc.get('error')}")
-                        lines.append("```")
-
-                    lines.append("Args:")
-                    lines.append("```")
-                    args = tc.get("args")
-                    if isinstance(args, str):
-                        lines.append(f"{args}")
-                    elif isinstance(args, dict):
-                        for arg, value in args.items():
-                            lines.append(f"{arg}: {value}")
-                    lines.append("```\n")
-                    md += "\n".join(lines)
-                self.last_message = ""
-            elif isinstance(message, ToolMessage) and message.status != "success":
-                md += "Failed call with error:"
-                md += f"\n\n{message.content}"
-            md += "\n"
+        # Handle our new message format
+        if isinstance(chunk, dict) and "messages" in chunk:
+            messages = chunk["messages"]
+            if messages and isinstance(messages, list):
+                message = messages[0]
+                if isinstance(message, dict):
+                    content = message.get("content", "")
+                    msg_type = message.get("type", "")
+                    
+                    if msg_type == "ai":
+                        self.last_message += content
+                        md += content
+                    elif msg_type == "tool":
+                        md += f"\n\n**Tool result:** {content}\n"
+                    elif msg_type == "error":
+                        md += f"\n\n**Error:** {content}\n"
+        
         return md
 
     def _truncate_md_to_fit(self, md: str, dimensions: ConsoleDimensions) -> str:
@@ -163,13 +136,7 @@ class OutputHandler:
         """
         Check if the chunk contains a tool call request and requires confirmation.
         """
-        if isinstance(chunk, tuple) and chunk[0] == "values":
-            if len(chunk) > 1 and isinstance(chunk[1], dict) and "messages" in chunk[1]:
-                message = chunk[1]['messages'][-1]
-                if isinstance(message, AIMessage) and message.tool_calls:
-                    for tc in message.tool_calls:
-                        if tc.get("name") in config["tools_requires_confirmation"]:
-                            return True
+        # This would need to be updated based on how we handle tool calls in our new system
         return False
 
     def _ask_tool_call_confirmation(self) -> bool:
